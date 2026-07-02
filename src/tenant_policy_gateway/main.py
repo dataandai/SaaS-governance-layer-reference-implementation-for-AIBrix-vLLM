@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 
 from .adapter_governance import evaluate_adapter_governance
 from .audit import AuditSink, audit_event_from_metering
-from .billing_ledger import BillingLedger
+from .billing_ledger import BillingLedger, BillingLedgerError
 from .config import AppSettings, AuthMode, BillingMode, get_settings
 from .header_sanitizer import (
     inject_trusted_headers,
@@ -24,10 +24,11 @@ from .metering import (
     TokenEstimate,
     emit_metering_event,
     estimate_input_tokens,
+    initialize_tokenizer,
     estimate_input_tokens_from_upstream,
     estimate_output_tokens,
 )
-from .policy_engine import PolicyDecision, evaluate_policy, request_attributes_from_body
+from .policy_engine import InvalidRequestError, PolicyDecision, evaluate_policy, parse_gateway_request_body
 from .proxy import forward_to_upstream, open_upstream_stream
 from .quota_enforcer import QuotaEnforcer, create_quota_enforcer
 from .security_posture import emit_security_posture, enforce_security_posture, evaluate_security_posture
@@ -49,18 +50,30 @@ async def lifespan(app: FastAPI):
     findings = evaluate_security_posture(settings)
     emit_security_posture(findings)
     app.state.security_posture_block = enforce_security_posture(settings, findings)
-
-    app.state.quota_enforcer = create_quota_enforcer(settings)
     app.state.audit_sink = AuditSink(mode=settings.audit_sink, jsonl_path=settings.audit_log_path)
-    app.state.billing_ledger = BillingLedger(
-        mode=settings.billing_mode,
-        jsonl_path=settings.billing_ledger_path,
-        aws_s3_bucket=settings.aws_billing_s3_bucket,
-        aws_s3_prefix=settings.aws_billing_s3_prefix,
-        aws_dynamodb_table=settings.aws_billing_dynamodb_table,
-        aws_region=settings.aws_region,
-    )
     app.state.slo_metrics = SloMetrics()
+
+    if app.state.security_posture_block:
+        # In enforce mode, fail readiness and requests without initializing
+        # expensive/runtime-sensitive dependencies such as production tokenizers,
+        # Redis, or AWS ledger clients. This preserves a useful /readyz finding.
+        app.state.quota_enforcer = None
+        app.state.billing_ledger = BillingLedger(mode=BillingMode.DISABLED)
+    else:
+        initialize_tokenizer(settings)
+        app.state.quota_enforcer = create_quota_enforcer(settings)
+        app.state.billing_ledger = BillingLedger(
+            mode=settings.billing_mode,
+            jsonl_path=settings.billing_ledger_path,
+            aws_s3_bucket=settings.aws_billing_s3_bucket,
+            aws_s3_prefix=settings.aws_billing_s3_prefix,
+            aws_dynamodb_table=settings.aws_billing_dynamodb_table,
+            aws_region=settings.aws_region,
+            batch_max_records=settings.billing_batch_max_records,
+            flush_interval_seconds=settings.billing_flush_interval_seconds,
+            queue_max_records=settings.billing_queue_max_records,
+            lru_max_request_ids=settings.billing_lru_max_request_ids,
+        )
 
     if settings.auth_mode == AuthMode.MOCK:
         LOG.warning(
@@ -79,7 +92,12 @@ async def lifespan(app: FastAPI):
         app.state.registry = None
         app.state.registry_error = str(exc)
         LOG.error('{"event":"registry_load_failed","reason":"%s"}', str(exc).replace('"', "'"))
-    yield
+    try:
+        yield
+    finally:
+        ledger = getattr(app.state, "billing_ledger", None)
+        if ledger is not None:
+            ledger.close()
 
 
 def create_app(settings: AppSettings | None = None, registry: TenantRegistry | None = None) -> FastAPI:
@@ -154,7 +172,19 @@ def create_app(settings: AppSettings | None = None, registry: TenantRegistry | N
                 input_token_estimate=None,
             )
 
-        attributes = request_attributes_from_body(domain, body)
+        try:
+            parsed_request = parse_gateway_request_body(domain=domain, request_body=body, upstream_path=upstream_path)
+            attributes = parsed_request.attributes
+            body = parsed_request.body
+        except InvalidRequestError as exc:
+            return _emit_and_respond(
+                request_id=request_id,
+                start=start,
+                decision=PolicyDecision(False, 400, exc.reason),
+                domain=domain,
+                response_body={"error": {"code": exc.reason, "message": exc.details}},
+                input_token_estimate=None,
+            )
         tenant = registry.resolve_by_host(domain) if registry else None
         principal: AuthenticatedPrincipal | None = None
         auth_error_reason: str | None = None
@@ -243,6 +273,7 @@ def create_app(settings: AppSettings | None = None, registry: TenantRegistry | N
                 user_id=decision.user_id,
                 limits=decision.tenant.limits,
                 estimated_input_tokens=input_token_estimate.value if input_token_estimate else None,
+                request_id=request_id,
             )
             if not quota_decision.allowed:
                 headers = {}
@@ -287,7 +318,7 @@ def create_app(settings: AppSettings | None = None, registry: TenantRegistry | N
             upstream = await forward_to_upstream(path=upstream_path, body=body, headers=outbound_headers, settings=settings)
         finally:
             if quota_recorded and quota_enforcer is not None:
-                quota_enforcer.finish_request(tenant_id=decision.tenant_id, user_id=decision.user_id)
+                quota_enforcer.finish_request(tenant_id=decision.tenant_id, user_id=decision.user_id, request_id=request_id)
 
         ledger: BillingLedger = app.state.billing_ledger
         ledger_usage = ledger.require_usage_tokens(upstream.body)
@@ -316,14 +347,34 @@ def create_app(settings: AppSettings | None = None, registry: TenantRegistry | N
                     input_token_estimate=input_token_estimate,
                     upstream_status_code=upstream.status_code,
                 )
-            ledger.append(
-                request_id=request_id,
-                tenant_id=decision.tenant_id,
-                user_id=decision.user_id,
-                model=decision.model,
-                adapter=decision.adapter,
-                usage=ledger_usage,
-            )
+            try:
+                ledger.append(
+                    request_id=request_id,
+                    tenant_id=decision.tenant_id,
+                    user_id=decision.user_id,
+                    model=decision.model,
+                    adapter=decision.adapter,
+                    usage=ledger_usage,
+                )
+            except BillingLedgerError as exc:
+                return _emit_and_respond(
+                    request_id=request_id,
+                    start=start,
+                    decision=PolicyDecision(
+                        False,
+                        503,
+                        str(exc),
+                        tenant=decision.tenant,
+                        tenant_id=decision.tenant_id,
+                        user_id=decision.user_id,
+                        model=decision.model,
+                        adapter=decision.adapter,
+                    ),
+                    domain=domain,
+                    response_body={"error": {"code": str(exc), "message": str(exc)}},
+                    input_token_estimate=input_token_estimate,
+                    upstream_status_code=upstream.status_code,
+                )
 
         upstream_input_estimate = estimate_input_tokens_from_upstream(upstream.body)
         output_token_estimate = estimate_output_tokens(upstream.body)
@@ -415,7 +466,7 @@ def create_app(settings: AppSettings | None = None, registry: TenantRegistry | N
             finally:
                 quota_enforcer: QuotaEnforcer | None = app.state.quota_enforcer
                 if quota_recorded and quota_enforcer is not None:
-                    quota_enforcer.finish_request(tenant_id=decision.tenant_id, user_id=decision.user_id)
+                    quota_enforcer.finish_request(tenant_id=decision.tenant_id, user_id=decision.user_id, request_id=request_id)
                 latency_ms = round((time.perf_counter() - start) * 1000, 3)
                 metrics: SloMetrics = app.state.slo_metrics
                 metrics.record_stream(tenant_id=decision.tenant_id, ttft_ms=first_token_ms, token_count_hint=token_hint_total)

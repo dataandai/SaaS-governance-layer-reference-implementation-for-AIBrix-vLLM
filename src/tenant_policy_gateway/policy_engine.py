@@ -1,10 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .jwt_validation import AuthenticatedPrincipal
 from .tenant_registry import TenantConfig, TenantRegistry
+
+
+class InvalidRequestError(ValueError):
+    """Raised when an incoming LLM request violates the gateway API contract."""
+
+    def __init__(self, reason: str, details: str | None = None) -> None:
+        super().__init__(details or reason)
+        self.reason = reason
+        self.details = details or reason
 
 
 @dataclass(frozen=True)
@@ -12,6 +23,13 @@ class RequestAttributes:
     domain: str | None
     model: str | None
     adapter: str | None
+
+
+@dataclass(frozen=True)
+class ParsedGatewayRequest:
+    attributes: RequestAttributes
+    body: dict[str, Any]
+    endpoint: Literal["chat", "completion"]
 
 
 @dataclass(frozen=True)
@@ -26,35 +44,203 @@ class PolicyDecision:
     adapter: str | None = None
 
 
-def extract_adapter(request_body: dict[str, Any]) -> str | None:
-    """Extract a LoRA adapter name from common demo shapes.
+class _StrictBaseModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
-    This is deliberately conservative. Production systems should normalize adapter
-    identity in a stable API contract rather than accepting every vendor-specific field.
+
+class FunctionCall(_StrictBaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCallFunction(_StrictBaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(_StrictBaseModel):
+    id: str | None = None
+    type: Literal["function"] = "function"
+    function: ToolCallFunction
+
+
+class ImageUrlPart(_StrictBaseModel):
+    url: str
+    detail: Literal["auto", "low", "high"] | None = None
+
+
+class TextContentPart(_StrictBaseModel):
+    type: Literal["text"]
+    text: str
+
+
+class InputTextContentPart(_StrictBaseModel):
+    type: Literal["input_text"]
+    text: str
+
+
+class ImageUrlContentPart(_StrictBaseModel):
+    type: Literal["image_url"]
+    image_url: ImageUrlPart
+
+
+class InputImageContentPart(_StrictBaseModel):
+    type: Literal["input_image"]
+    image_url: str | ImageUrlPart
+
+
+ChatContentPart = TextContentPart | InputTextContentPart | ImageUrlContentPart | InputImageContentPart
+
+
+class ChatMessage(_StrictBaseModel):
+    role: Literal["system", "user", "assistant", "tool", "developer"]
+    content: str | list[ChatContentPart] | None = None
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[ToolCall] | None = None
+    function_call: FunctionCall | None = None
+
+    @model_validator(mode="after")
+    def require_content_or_tool_payload(self) -> "ChatMessage":
+        if self.content is None and self.tool_calls is None and self.function_call is None:
+            raise ValueError("message must include content, tool_calls, or function_call")
+        return self
+
+
+class ResponseFormat(_StrictBaseModel):
+    type: Literal["text", "json_object"]
+
+
+class ChatCompletionGatewayRequest(_StrictBaseModel):
+    """Strict API contract accepted by the gateway for chat completions.
+
+    Unknown vendor-specific fields are rejected instead of forwarded. The only
+    adapter selector accepted by this gateway is the canonical `lora_adapter`
+    field. This prevents hidden upstream knobs from bypassing the tenant adapter
+    policy by being invisible to policy evaluation.
     """
 
-    candidates = [
-        request_body.get("lora_adapter"),
-        request_body.get("adapter"),
-        request_body.get("lora"),
-    ]
-    metadata = request_body.get("metadata")
-    if isinstance(metadata, dict):
-        candidates.append(metadata.get("lora_adapter"))
-        candidates.append(metadata.get("adapter"))
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return None
+    model: str
+    messages: list[ChatMessage] = Field(min_length=1)
+    lora_adapter: str | None = None
+    stream: bool = False
+    temperature: float | None = Field(default=None, ge=0)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    n: int | None = Field(default=None, ge=1, le=16)
+    stop: str | list[str] | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    seed: int | None = None
+    response_format: ResponseFormat | None = None
+
+    @field_validator("model", "lora_adapter")
+    @classmethod
+    def normalize_non_empty_strings(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("field must not be blank")
+        return normalized
+
+
+CompletionPrompt = str | list[str] | list[int] | list[list[int]]
+
+
+class CompletionGatewayRequest(_StrictBaseModel):
+    model: str
+    prompt: CompletionPrompt
+    lora_adapter: str | None = None
+    stream: bool = False
+    suffix: str | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
+    temperature: float | None = Field(default=None, ge=0)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    n: int | None = Field(default=None, ge=1, le=16)
+    stop: str | list[str] | None = None
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    seed: int | None = None
+
+    @field_validator("model", "lora_adapter")
+    @classmethod
+    def normalize_non_empty_strings(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("field must not be blank")
+        return normalized
+
+
+def parse_gateway_request_body(
+    *,
+    domain: str | None,
+    request_body: dict[str, Any],
+    upstream_path: str,
+) -> ParsedGatewayRequest:
+    endpoint = _endpoint_from_path(upstream_path, request_body)
+    try:
+        if endpoint == "chat":
+            parsed = ChatCompletionGatewayRequest.model_validate(request_body)
+        else:
+            parsed = CompletionGatewayRequest.model_validate(request_body)
+    except ValidationError as exc:
+        raise InvalidRequestError("invalid_request_schema", _format_validation_error(exc)) from exc
+
+    normalized_body = parsed.model_dump(mode="json", exclude_none=True)
+    attributes = RequestAttributes(
+        domain=domain.lower() if domain else None,
+        model=parsed.model,
+        adapter=parsed.lora_adapter,
+    )
+    return ParsedGatewayRequest(attributes=attributes, body=normalized_body, endpoint=endpoint)
 
 
 def request_attributes_from_body(domain: str | None, request_body: dict[str, Any]) -> RequestAttributes:
-    model = request_body.get("model")
-    return RequestAttributes(
-        domain=domain.lower() if domain else None,
-        model=model.strip() if isinstance(model, str) and model.strip() else None,
-        adapter=extract_adapter(request_body),
-    )
+    """Backward-compatible helper for older tests/call sites.
+
+    It now validates the request against the strict schema instead of scavenging
+    for vendor-specific fields.
+    """
+
+    parsed = parse_gateway_request_body(domain=domain, request_body=request_body, upstream_path="auto")
+    return parsed.attributes
+
+
+def extract_adapter(request_body: dict[str, Any]) -> str | None:
+    """Return the canonical adapter field after strict schema validation.
+
+    Only `lora_adapter` is accepted. Legacy aliases such as `adapter`, `lora`,
+    `metadata.adapter`, or vendor-specific hidden fields are intentionally not
+    supported and will be rejected by `parse_gateway_request_body`.
+    """
+
+    parsed = parse_gateway_request_body(domain=None, request_body=request_body, upstream_path="auto")
+    return parsed.attributes.adapter
+
+
+def _endpoint_from_path(upstream_path: str, request_body: dict[str, Any]) -> Literal["chat", "completion"]:
+    if upstream_path.endswith("/v1/chat/completions") or upstream_path.endswith("chat/completions"):
+        return "chat"
+    if upstream_path.endswith("/v1/completions") or upstream_path.endswith("completions"):
+        return "completion"
+    if "messages" in request_body:
+        return "chat"
+    if "prompt" in request_body:
+        return "completion"
+    raise InvalidRequestError("invalid_request_schema", "request must include either messages or prompt")
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    parts: list[str] = []
+    for error in exc.errors():
+        location = ".".join(str(item) for item in error.get("loc", ())) or "body"
+        message = str(error.get("msg", "invalid value"))
+        parts.append(f"{location}: {message}")
+    return "; ".join(parts[:8])
 
 
 def evaluate_policy(

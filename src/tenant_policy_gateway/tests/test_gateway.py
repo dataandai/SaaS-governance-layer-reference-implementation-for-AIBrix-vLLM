@@ -221,7 +221,7 @@ def test_metering_event_is_emitted(client: TestClient, caplog: pytest.LogCapture
     assert event["decision"] == "allow"
     assert event["upstream_status_code"] == 200
     assert event["estimated_input_tokens"] is not None
-    assert event["estimated_input_token_source"] in {"upstream_usage_prompt_tokens_unverified", "optional_tiktoken_cl100k_base_observability_estimate", "heuristic_chars_div_4_observability_estimate"}
+    assert event["estimated_input_token_source"] in {"upstream_usage_prompt_tokens_unverified", "deterministic_utf8_byte_upper_bound_local_demo", "tiktoken:cl100k_base"}
     assert event["estimated_input_tokens_billing_grade"] is False
 
 
@@ -570,7 +570,9 @@ def test_redis_quota_enforcer_uses_atomic_lua_scripts() -> None:
     assert "_REDIS_CHECK_AND_RECORD_LUA" in source
     assert "tenant_concurrency_quota_exceeded" in source
     assert "evalsha" in source
-    assert "INCR" in source
+    assert "ZADD" in source
+    assert "ZREMRANGEBYSCORE" in source
+    assert "fixed window" not in source.lower()
 
 
 def test_aws_native_billing_uses_boto3_and_dynamodb_idempotency(tmp_path: Path) -> None:
@@ -608,7 +610,48 @@ def test_aws_native_billing_uses_boto3_and_dynamodb_idempotency(tmp_path: Path) 
     usage = UsageTokens(prompt_tokens=1, completion_tokens=2, total_tokens=3, source="upstream_usage_required")
     ledger.append(request_id="req-1", tenant_id="tenant-a", user_id="u", model="m", adapter=None, usage=usage)
     ledger.append(request_id="req-1", tenant_id="tenant-a", user_id="u", model="m", adapter=None, usage=usage)
+    ledger.flush()
     assert len(fake_dynamo.items) == 1
     assert len(fake_dynamo.updates) == 1
     assert len(fake_s3.objects) == 1
     assert fake_s3.objects[0]["Bucket"] == "billing-bucket"
+
+
+def test_unknown_vendor_adapter_field_is_rejected(client: TestClient) -> None:
+    body = _chat_body(adapter=None)
+    body["adapter"] = "tenant-a-support"
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers("tenant-a.example.local"),
+        json=body,
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request_schema"
+
+
+def test_deterministic_token_estimator_does_not_use_chars_div_4() -> None:
+    from tenant_policy_gateway.metering import estimate_input_tokens, initialize_tokenizer
+    from tenant_policy_gateway.config import AppSettings
+
+    initialize_tokenizer(AppSettings())
+    estimate = estimate_input_tokens({"model": "m", "prompt": "éééé"})
+    assert estimate is not None
+    assert estimate.source == "deterministic_utf8_byte_upper_bound_local_demo"
+    assert estimate.value == len("éééé".encode("utf-8"))
+
+
+def test_billing_lru_is_bounded(tmp_path: Path) -> None:
+    from tenant_policy_gateway.billing_ledger import BillingLedger, UsageTokens
+
+    ledger = BillingLedger(
+        mode=BillingMode.LEDGER_REQUIRED,
+        jsonl_path=tmp_path / "ledger.jsonl",
+        lru_max_request_ids=3,
+        batch_max_records=10,
+        flush_interval_seconds=100,
+    )
+    usage = UsageTokens(prompt_tokens=1, completion_tokens=1, total_tokens=2, source="upstream_usage_required")
+    for idx in range(5):
+        ledger.append(request_id=f"req-{idx}", tenant_id="tenant-a", user_id="u", model="m", adapter=None, usage=usage)
+    assert len(ledger._seen_request_ids) == 3
+    ledger.close()

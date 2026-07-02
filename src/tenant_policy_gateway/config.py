@@ -42,6 +42,12 @@ class SecurityPostureMode(str, Enum):
     ENFORCE = "enforce"
 
 
+class TokenizerMode(str, Enum):
+    TIKTOKEN = "tiktoken"
+    HF_LOCAL = "hf_local"
+    UTF8_BYTES = "utf8_bytes"
+
+
 LOCAL_ENVIRONMENTS = {"local", "dev", "development", "test", "ci"}
 
 
@@ -74,12 +80,21 @@ class AppSettings(BaseModel):
     quota_window_seconds: int = Field(default=60, ge=1)
     redis_quota_url: str = Field(default="redis://localhost:6379/0")
     redis_quota_key_prefix: str = Field(default="aibrix-gateway")
+    redis_quota_concurrency_ttl_seconds: int = Field(default=900, ge=1)
+    tokenizer_mode: TokenizerMode = Field(default=TokenizerMode.UTF8_BYTES)
+    tokenizer_name: str = Field(default="cl100k_base")
+    tokenizer_path: Path | None = Field(default=None)
+    require_production_tokenizer: bool = Field(default=True)
     billing_mode: BillingMode = Field(default=BillingMode.OBSERVABILITY)
     billing_ledger_path: Path = Field(default=Path("./var/billing-ledger.jsonl"))
     aws_billing_s3_bucket: str | None = Field(default=None)
     aws_billing_s3_prefix: str = Field(default="billing-ledger/")
     aws_billing_dynamodb_table: str | None = Field(default=None)
     aws_region: str | None = Field(default=None)
+    billing_batch_max_records: int = Field(default=1000, ge=1)
+    billing_flush_interval_seconds: float = Field(default=5.0, ge=0.1)
+    billing_queue_max_records: int = Field(default=10000, ge=1)
+    billing_lru_max_request_ids: int = Field(default=100000, ge=1)
     allow_streaming_without_billing_usage: bool = Field(default=False)
     audit_sink: AuditSinkMode = Field(default=AuditSinkMode.STDOUT)
     audit_log_path: Path = Field(default=Path("./var/audit.jsonl"))
@@ -111,6 +126,12 @@ class AppSettings(BaseModel):
                 "Use APP_AUTH_MODE=oidc outside local development, or set "
                 "APP_UNSAFE_ALLOW_MOCK_AUTH_OUTSIDE_LOCAL=true only for an explicit throwaway demo."
             )
+        return self
+
+    @model_validator(mode="after")
+    def require_tokenizer_assets_for_configured_mode(self) -> "AppSettings":
+        if self.tokenizer_mode == TokenizerMode.HF_LOCAL and not self.tokenizer_path:
+            raise ValueError("APP_TOKENIZER_PATH is required when APP_TOKENIZER_MODE=hf_local")
         return self
 
     @model_validator(mode="after")
@@ -166,12 +187,21 @@ def load_settings_from_env() -> AppSettings:
         "quota_window_seconds": int(os.getenv("APP_QUOTA_WINDOW_SECONDS", "60")),
         "redis_quota_url": os.getenv("APP_REDIS_QUOTA_URL", "redis://localhost:6379/0"),
         "redis_quota_key_prefix": os.getenv("APP_REDIS_QUOTA_KEY_PREFIX", "aibrix-gateway"),
+        "redis_quota_concurrency_ttl_seconds": int(os.getenv("APP_REDIS_QUOTA_CONCURRENCY_TTL_SECONDS", "900")),
+        "tokenizer_mode": os.getenv("APP_TOKENIZER_MODE", "utf8_bytes"),
+        "tokenizer_name": os.getenv("APP_TOKENIZER_NAME", "cl100k_base"),
+        "tokenizer_path": os.getenv("APP_TOKENIZER_PATH") or None,
+        "require_production_tokenizer": _parse_bool(os.getenv("APP_REQUIRE_PRODUCTION_TOKENIZER"), True),
         "billing_mode": os.getenv("APP_BILLING_MODE", "observability"),
         "billing_ledger_path": os.getenv("APP_BILLING_LEDGER_PATH", "./var/billing-ledger.jsonl"),
         "aws_billing_s3_bucket": os.getenv("APP_AWS_BILLING_S3_BUCKET") or None,
         "aws_billing_s3_prefix": os.getenv("APP_AWS_BILLING_S3_PREFIX", "billing-ledger/"),
         "aws_billing_dynamodb_table": os.getenv("APP_AWS_BILLING_DYNAMODB_TABLE") or None,
         "aws_region": os.getenv("AWS_REGION") or os.getenv("APP_AWS_REGION") or None,
+        "billing_batch_max_records": int(os.getenv("APP_BILLING_BATCH_MAX_RECORDS", "1000")),
+        "billing_flush_interval_seconds": float(os.getenv("APP_BILLING_FLUSH_INTERVAL_SECONDS", "5")),
+        "billing_queue_max_records": int(os.getenv("APP_BILLING_QUEUE_MAX_RECORDS", "10000")),
+        "billing_lru_max_request_ids": int(os.getenv("APP_BILLING_LRU_MAX_REQUEST_IDS", "100000")),
         "allow_streaming_without_billing_usage": _parse_bool(os.getenv("APP_ALLOW_STREAMING_WITHOUT_BILLING_USAGE"), False),
         "audit_sink": os.getenv("APP_AUDIT_SINK", "stdout"),
         "audit_log_path": os.getenv("APP_AUDIT_LOG_PATH", "./var/audit.jsonl"),
