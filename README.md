@@ -1,24 +1,54 @@
-# aibrix-multitenant-llm-gateway
+# aibrix-tenant-gateway
 
-**Audit-hardened AWS/EKS reference lab for tenant-governed LLM serving in front of AIBrix/vLLM.**
+> AIBrix/vLLM is excellent at serving. It is not, by itself, your SaaS security
 
-This repository shows how to place a SaaS governance layer in front of an LLM serving substrate. It uses a FastAPI **Tenant Policy Gateway** to validate tenant identity, enforce model and LoRA policy, strip spoofable routing headers, inject trusted internal routing metadata, emit audit/metering events, and forward allowed traffic to AIBrix/vLLM.
+> or governance boundary. This is the layer that goes in front.
 
-This is **not** a production-certified SaaS LLM platform. It is a deployable reference lab for engineers who want to understand the hard parts of multi-tenant LLM serving on Kubernetes and AWS EKS.
+An **audit-hardened AWS/EKS reference implementation** of a tenant policy gateway
 
-## PR10 core hardening update
+for multi-tenant LLM serving: a FastAPI gateway that validates tenant identity,
 
-The latest core-hardening pass tightened the runtime internals behind the earlier AWS audit work:
+enforces model and LoRA adapter policy, strips spoofable routing headers, injects
 
-- Redis quota now uses ZSET-based sliding-window Lua scripts instead of fixed buckets.
-- Concurrency tracking is request-id based and protected by stale-entry TTL cleanup.
-- Token estimation no longer uses the loose `len(text) // 4` fallback. Production-like quota modes must initialize a real tokenizer at startup.
-- Incoming request bodies are parsed through strict Pydantic contracts. Unknown/vendor-specific fields are rejected fail-closed.
-- Billing ledger writes are memory-bounded and batched before S3/JSONL flushes, with bounded LRU replay protection.
+trusted routing metadata, meters usage, and forwards allowed traffic to
 
-These are production-grade implementation patterns, not a production certification. Live AWS, Redis, S3/DynamoDB, tokenizer artifact, and AIBrix/vLLM load-test evidence are still required before any real SaaS use.
+AIBrix/vLLM — with a streaming proxy that measures TTFT per request.
 
----
+It is the **open reference implementation of the serving-governance patterns I
+
+deploy for clients running private, on-prem or sovereign LLM infrastructure**,
+
+rebuilt on public components so the architecture can be inspected and challenged
+
+without touching any client system.
+
+**Who this is for:** platform engineers putting vLLM-class serving behind real
+
+tenancy — where "tenant A must never see tenant B's adapters" has to hold against
+
+an adversarial client, not just a well-behaved demo.
+
+**60-second orientation:**
+
+- 🔐 Tenant = Host-domain mapping **and** JWT tenant claim — both must agree; cross-tenant tokens are denied
+
+- 🧹 Spoofable routing headers (`x-tenant-id`, `external-filter`, `config-profile`, …) are stripped, then trusted values are re-injected server-side
+
+- 📜 Per-tenant model **and** LoRA adapter allowlists, fail-closed
+
+- ⏱️ Redis ZSET sliding-window quotas via Lua, request-id concurrency tracking, real-tokenizer-backed estimation (no `len(text)//4` shortcuts)
+
+- 🧱 Strict Pydantic contracts; unknown/vendor fields rejected fail-closed
+
+- 🧾 Structured audit/metering events; batched billing ledger reference with S3 Object Lock + DynamoDB idempotency
+
+- 📈 SSE streaming proxy with TTFT metrics and upstream status propagation
+
+- 🚀 Three run modes: local (no AWS, no GPU) → CPU-only EKS smoke test → full GPU AIBrix/vLLM stack
+
+*(demo GIF here — `make demo-a` / `demo-cross` / `demo-spoof` in 30 seconds is perfect material)*
+
+
 
 ## The short version
 
